@@ -1,0 +1,11 @@
+# Slack Bot フレームワーク
+slack-bolt>=1.21.0
+
+# Google Gemini API（LLM抽出）
+google-genai>=1.0.0
+
+# Supabase クライアント
+supabase>=2.5.0
+
+# 環境変数の読み込み（.env ファイル）
+python-dotenv>=1.0.0
