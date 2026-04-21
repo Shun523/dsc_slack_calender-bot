@@ -9,6 +9,7 @@ import json
 import logging
 import time
 import uuid
+import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -17,7 +18,6 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from google import genai
 from google.genai import types as genai_types
-from supabase import create_client, Client
 
 # ── 環境変数の読み込み ────────────────────────────────────────
 env_path = Path(__file__).parent.parent / ".env"
@@ -26,9 +26,8 @@ load_dotenv(dotenv_path=env_path)
 SLACK_BOT_TOKEN  = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN  = os.getenv("SLACK_APP_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
-SUPABASE_URL     = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
-SUPABASE_KEY     = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
-SUPABASE_SVC_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+NEXT_APP_URL     = os.getenv("NEXT_APP_URL")
+BOT_API_SECRET   = os.getenv("BOT_API_SECRET")
 
 # ── 起動時チェック ────────────────────────────────────────────
 if not SLACK_BOT_TOKEN or SLACK_BOT_TOKEN.startswith("xoxb-your"):
@@ -37,11 +36,11 @@ if not SLACK_BOT_TOKEN or SLACK_BOT_TOKEN.startswith("xoxb-your"):
 if not SLACK_APP_TOKEN or SLACK_APP_TOKEN.startswith("xapp-your"):
     print("❌ SLACK_APP_TOKEN が未設定です。.env を確認してください。")
     sys.exit(1)
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ Supabase の環境変数が未設定です。.env を確認してください。")
+if not NEXT_APP_URL:
+    print("❌ NEXT_APP_URL が未設定です。.env を確認してください。")
     sys.exit(1)
-if not SUPABASE_SVC_KEY:
-    print("❌ SUPABASE_SERVICE_ROLE_KEY が未設定です。.env を確認してください。")
+if not BOT_API_SECRET:
+    print("❌ BOT_API_SECRET が未設定です。.env を確認してください。")
     sys.exit(1)
 if not GEMINI_API_KEY or GEMINI_API_KEY == "your-gemini-api-key":
     print("⚠️  GEMINI_API_KEY が未設定です。🗓️スタンプを検知しても日程抽出は行われません。")
@@ -54,9 +53,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── クライアント初期化 ────────────────────────────────────────
-app              = App(token=SLACK_BOT_TOKEN)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SVC_KEY)
-gemini           = genai.Client(api_key=GEMINI_API_KEY)
+app    = App(token=SLACK_BOT_TOKEN)
+gemini = genai.Client(api_key=GEMINI_API_KEY)
 
 TARGET_EMOJI = "spiral_calendar_pad"  # 🗓️
 JST          = timezone(timedelta(hours=9))
@@ -132,25 +130,55 @@ def extract_event_with_llm(message_text: str) -> dict | None:
     return None
 
 
-def save_event_to_db(event_data: dict, slack_thread_ts: str) -> bool:
-    """Supabaseに保存。同じslack_thread_tsが既存ならFalseを返す。"""
-    try:
-        existing = supabase.table("events").select("id").eq("slack_thread_ts", slack_thread_ts).execute()
-        if existing.data:
-            logger.info(f"[DB] 登録済みのためスキップ: {slack_thread_ts}")
+def validate_event_data(event_data: dict) -> bool:
+    """LLMが返したイベントデータの基本的な整合性を確認する。"""
+    if not isinstance(event_data.get("title"), str) or not event_data["title"].strip():
+        logger.error(f"[Validate] title が無効: {event_data.get('title')}")
+        return False
+    if len(event_data["title"]) > 255:
+        logger.error("[Validate] title が255文字を超えています")
+        return False
+    for key in ("start_at", "end_at"):
+        val = event_data.get(key)
+        if not isinstance(val, str):
+            logger.error(f"[Validate] {key} が無効: {val}")
             return False
-        supabase.table("events").insert({
-            "title":           event_data["title"],
-            "start_at":        event_data["start_at"],
-            "end_at":          event_data["end_at"],
-            "location":        event_data.get("location"),
-            "slack_thread_ts": slack_thread_ts,
-            "is_public":       True,
-        }).execute()
-        logger.info(f"[DB] 登録完了: {event_data['title']}")
+        try:
+            datetime.fromisoformat(val)
+        except ValueError:
+            logger.error(f"[Validate] {key} が ISO 8601 形式ではありません: {val}")
+            return False
+    if datetime.fromisoformat(event_data["start_at"]) >= datetime.fromisoformat(event_data["end_at"]):
+        logger.error("[Validate] start_at が end_at 以降になっています")
+        return False
+    return True
+
+
+def save_event_to_db(event_data: dict, slack_thread_ts: str) -> bool:
+    """Next.js APIルート経由でイベントを保存する。重複時はFalseを返す。"""
+    try:
+        res = requests.post(
+            f"{NEXT_APP_URL}/api/bot/events",
+            json={
+                "title":           event_data["title"],
+                "start_at":        event_data["start_at"],
+                "end_at":          event_data["end_at"],
+                "location":        event_data.get("location"),
+                "slack_thread_ts": slack_thread_ts,
+            },
+            headers={"x-bot-secret": BOT_API_SECRET},
+            timeout=10,
+        )
+        if res.status_code == 409:
+            logger.info(f"[API] 登録済みのためスキップ: {slack_thread_ts}")
+            return False
+        if not res.ok:
+            logger.error(f"[API] 保存エラー: {res.status_code} {res.text}")
+            return False
+        logger.info(f"[API] 登録完了: {event_data['title']}")
         return True
     except Exception as e:
-        logger.error(f"[DB] 保存エラー: {e}")
+        logger.error(f"[API] 接続エラー: {e}")
         return False
 
 
@@ -231,8 +259,8 @@ def handle_reaction_added(event: dict, client, logger):
         return
 
     event_data = extract_event_with_llm(message_text)
-    if not event_data or not event_data.get("title") or not event_data.get("start_at"):
-        logger.error(f"[LLM] 日程の抽出に失敗しました: {event_data}")
+    if not event_data or not validate_event_data(event_data):
+        logger.error(f"[LLM] 日程の抽出またはバリデーションに失敗しました: {event_data}")
         return
 
     logger.info(f"[LLM] 抽出結果: {event_data}")
